@@ -1,0 +1,503 @@
+---
+title: "Predicting Mortality in Heart Failure Patients"
+author: "Michael Matyevich"
+date: "2026-04-06"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: flatly
+    highlight: tango
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+library(tidyverse)
+library(caret)
+library(MASS)
+library(pROC)
+library(corrplot)
+library(glmnet)
+library(dplyr)
+
+hfc_records <- read.csv("C:/Users/micha/Downloads/heart_failure_clinical_records_dataset.csv",
+                        stringsAsFactors = TRUE)
+```
+
+---
+
+## Background
+
+Heart failure is a condition where the heart cannot pump enough blood to meet the body's needs.
+It is a leading cause of hospitalisation and death worldwide, and identifying which patients are
+at highest risk of dying allows clinicians to prioritise monitoring and intervention resources
+more effectively.
+
+This analysis uses clinical records from 299 heart failure patients to build and compare
+classification models that predict 30-day mortality. All four models are evaluated under the
+same cross-validation framework so performance comparisons are fair.
+
+---
+
+## Research Questions
+
+**RQ1 — Which clinical measurements are most strongly associated with mortality in heart failure
+patients?**
+
+Understanding which variables matter most guides both clinical triage and future data collection
+priorities. If a small number of cheap, routine measurements can predict mortality accurately,
+that has immediate practical value.
+
+**RQ2 — Does LASSO variable selection produce a more parsimonious model without meaningfully
+sacrificing predictive performance compared to a full model?**
+
+Simpler models are easier to explain to clinicians, less likely to overfit on small datasets,
+and cheaper to implement in practice. LASSO is a principled way to find a minimal sufficient
+predictor set — we compare it directly to the full model.
+
+**RQ3 — Do linear discriminant methods (LDA, QDA) perform competitively with logistic
+regression for this classification task?**
+
+LDA and QDA make different assumptions about the data compared to logistic regression. Testing
+all three helps us understand whether the distributional assumptions underlying each method
+are supported by this dataset.
+
+---
+
+## Dataset Description
+
+The dataset contains **299 hospitalised heart failure patients** with 13 variables recorded
+during follow-up. The outcome is `DEATH_EVENT` — whether the patient died during the
+follow-up period (1 = died, 0 = survived).
+
+| Variable                  | Type        | Description                                         |
+|---------------------------|-------------|-----------------------------------------------------|
+| age                       | Numeric     | Age at time of hospitalisation (years)              |
+| anaemia                   | Binary      | Whether the patient has anaemia (0/1)               |
+| creatinine_phosphokinase  | Numeric     | Level of CPK enzyme in blood (mcg/L)                |
+| diabetes                  | Binary      | Whether the patient has diabetes (0/1)              |
+| ejection_fraction         | Numeric     | % of blood leaving heart per contraction            |
+| high_blood_pressure       | Binary      | Whether the patient has hypertension (0/1)          |
+| platelets                 | Numeric     | Platelet count (kiloplatelets/mL)                   |
+| serum_creatinine          | Numeric     | Level of creatinine in blood (mg/dL)                |
+| serum_sodium              | Numeric     | Level of sodium in blood (mEq/L)                    |
+| sex                       | Binary      | Biological sex (0 = female, 1 = male)               |
+| smoking                   | Binary      | Whether the patient smokes (0/1)                    |
+| time                      | Numeric     | Follow-up period in days                            |
+| DEATH_EVENT               | Binary      | **Outcome** — died during follow-up (1 = yes)       |
+
+The class split is approximately **67% survived and 33% died** — a moderate imbalance that
+means a naive model predicting "survived" for everyone would achieve 67% accuracy without
+learning anything. This is why we use metrics beyond simple accuracy (sensitivity, specificity,
+AUC-ROC) to evaluate performance.
+
+---
+
+## Exploratory Analysis
+
+```{r hfc}
+str(hfc_records)
+summary(hfc_records)
+
+hfc_records$DEATH_EVENT <- as.factor(hfc_records$DEATH_EVENT)
+colSums(is.na(hfc_records))
+```
+
+There are **no missing values** in this dataset, so no imputation is required.
+
+```{r scale}
+# Scale numeric variables so LDA / QDA will have equal weighting.
+# Without scaling, variables measured on larger scales (e.g. creatinine_phosphokinase
+# which can reach tens of thousands) would dominate the distance calculations
+# that LDA and QDA rely on, simply because of their units rather than their
+# actual predictive value.
+numeric_vars <- c("age", "creatinine_phosphokinase", "ejection_fraction",
+                  "platelets", "serum_creatinine", "serum_sodium", "time")
+hfc_records[numeric_vars] <- scale(hfc_records[numeric_vars])
+
+table(hfc_records$DEATH_EVENT)
+```
+
+The class distribution confirms the 67/33 split noted above. This is worth keeping in mind
+throughout — in a clinical context, the *cost of a false negative* (predicting "survived"
+when the patient actually dies) is much higher than the cost of a false positive. We will
+pay particular attention to **sensitivity** (the model's ability to correctly identify deaths)
+when comparing models.
+
+```{r corrplot}
+cor_matrix <- cor(hfc_records |> dplyr::select(-DEATH_EVENT))
+corrplot(cor_matrix)
+```
+
+The correlation matrix shows mostly weak relationships between predictors, which is good —
+it means we are unlikely to have severe multicollinearity issues where two variables are
+measuring nearly the same thing and destabilising coefficient estimates.
+
+```{r age-hist}
+ggplot(hfc_records, aes(age, fill = DEATH_EVENT)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Age distribution by survival outcome",
+       subtitle = "Deaths (1) appear more concentrated at older ages",
+       x = "Age (standardised)", y = "Count", fill = "Died") +
+  theme_minimal()
+```
+
+The age histogram gives an early indication that older patients are over-represented in the
+death group, consistent with age being a known risk factor in heart failure prognosis.
+However, the overlap between groups is substantial — age alone will not be sufficient to
+classify patients accurately.
+
+---
+
+## Train / Test Split
+
+```{r Train Test}
+train_set <- createDataPartition(hfc_records$DEATH_EVENT, p = 0.8, list = FALSE)
+train <- hfc_records[train_set, ]
+test  <- hfc_records[-train_set, ]
+```
+
+We partition the data into **80% training (~239 patients)** and **20% test (~60 patients)**.
+`createDataPartition` stratifies by the outcome variable, which preserves the 67/33 class
+ratio in both partitions. The test set is sealed from all modelling decisions — it is only
+used once at the end to report final performance.
+
+With only 299 patients total, this is a small dataset. Small samples mean performance
+estimates from a single split can be noisy — a handful of patients in the test set landing
+on one side or the other of the boundary can swing accuracy by several percentage points.
+This is precisely why we use **10-fold cross-validation** rather than relying on the split
+alone.
+
+---
+
+## Logistic Regression
+
+Logistic regression models the *probability* that a patient dies, as a function of their
+clinical measurements. It is the standard first-line tool for binary clinical outcomes because
+its coefficients have a direct interpretation: each coefficient represents the change in the
+log-odds of death for a one-unit increase in that predictor, holding all others constant.
+
+```{r Logistic Regression}
+log_model <- glm(DEATH_EVENT ~ ., data = train, family = binomial)
+summary(log_model)
+```
+
+The full model includes all 12 predictors. Looking at the summary, predictors with small
+p-values (conventionally below 0.05) are those showing the strongest independent associations
+with mortality after controlling for all other variables. Notably, **ejection fraction**,
+**serum creatinine**, and **time** (follow-up duration) typically emerge as significant — 
+consistent with the clinical literature on heart failure prognosis.
+
+The `time` variable deserves a note: it represents how long the patient was followed up,
+which partly reflects survival itself. In a prospective clinical model this would require
+careful handling, but for this predictive exercise we retain it.
+
+```{r stepwise}
+# Stepwise AIC reduces the model to a smaller set of predictors.
+# AIC (Akaike Information Criterion) penalises model complexity — adding a predictor
+# only "pays off" if it improves fit enough to justify the added parameter.
+# The "both" direction means variables can be added or removed at each step.
+step_model <- step(log_model, direction = "both")
+summary(step_model)
+```
+
+The stepwise procedure has reduced the model to 5 key features. This is useful for
+interpretability, but it is a greedy sequential process — it does not guarantee finding the
+globally best subset, and the selected variables can change substantially with small changes
+to the data. We compare this to LASSO below, which is a more principled approach to variable
+selection.
+
+---
+
+## Cross-Validation Setup
+
+```{r cv-setup}
+train_control <- trainControl(method = "cv",
+                              number = 10,
+                              classProbs   = TRUE,
+                              summaryFunction = twoClassSummary)
+
+# Relabel factor levels to valid R names — required by caret's internal functions
+levels(train$DEATH_EVENT) <- c("No", "Yes")
+levels(test$DEATH_EVENT)  <- c("No", "Yes")
+```
+
+We use **10-fold cross-validation** for all models. The training data is divided into 10
+equal chunks; each model is trained 10 times, each time using 9 chunks for training and
+1 chunk for validation, rotating through all 10. The 10 validation scores are averaged
+to give a stable performance estimate.
+
+This is more reliable than a single train/test split, especially with a small dataset like
+this one. It uses the training data more efficiently while still providing an honest
+estimate of how the model will perform on data it has never seen.
+
+`twoClassSummary` tells caret to report **AUC-ROC** as the primary metric, rather than
+simple accuracy. AUC-ROC is preferred for imbalanced classification problems because it
+simultaneously evaluates sensitivity and specificity across all possible classification
+thresholds — it is robust to the class imbalance in this dataset in a way that accuracy
+is not.
+
+---
+
+## LDA and QDA
+
+```{r lda-qda}
+lda_model <- lda(DEATH_EVENT ~ ., data = train)
+lda_pred  <- predict(lda_model, test)$class
+
+qda_model <- qda(DEATH_EVENT ~ ., data = train)
+qda_pred  <- predict(qda_model, test)$class
+```
+
+**LDA (Linear Discriminant Analysis)** finds the linear combination of predictors that best
+separates the two outcome classes. It assumes that both classes have the same covariance
+structure — i.e. the spread and shape of the predictor distributions is the same for
+survivors and deaths, just centred in different places.
+
+**QDA (Quadratic Discriminant Analysis)** relaxes this assumption and estimates a separate
+covariance matrix for each class, allowing the decision boundary between classes to be curved
+rather than a straight line. The trade-off is that QDA requires estimating substantially more
+parameters — with only 239 training patients and 12 predictors, this is a concern. A model
+that needs to estimate more parameters than the data comfortably supports will tend to overfit.
+
+---
+
+## LASSO Variable Selection
+
+LASSO (Least Absolute Shrinkage and Selection Operator) selects predictors by applying a
+penalty to the size of coefficients. As the penalty increases, less important predictors are
+shrunk to exactly zero and effectively removed from the model. The optimal penalty level is
+chosen by cross-validation — so the variable selection itself is cross-validated, not just
+the model performance.
+
+This is methodologically preferable to stepwise AIC because it optimises shrinkage and
+selection simultaneously rather than greedily stepping through one variable at a time.
+
+```{r LASSO}
+x_train <- model.matrix(DEATH_EVENT ~ ., data = train)[, -1]
+y_train <- train$DEATH_EVENT
+
+# CV LASSO — finds the penalty (lambda) that minimises cross-validated error
+lasso_cv <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1)
+plot(lasso_cv)
+```
+
+This plot shows the cross-validated error (binomial deviance, y-axis) across the range of
+penalty values (log lambda, x-axis). The left dashed line marks `lambda.min` — the penalty
+that minimises error. The right dashed line marks `lambda.1se` — a slightly larger penalty
+that gives a simpler model within one standard error of the minimum error. We use `lambda.1se`
+to favour parsimony.
+
+```{r lasso-coefs}
+lasso_coefs  <- coef(lasso_cv, s = "lambda.1se")
+selected_vars <- rownames(lasso_coefs)[which(lasso_coefs != 0)]
+selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+print(selected_vars)
+
+lasso_formula <- as.formula(paste("DEATH_EVENT ~", paste(selected_vars, collapse = " + ")))
+```
+
+LASSO has reduced the model to **3 variables**. The fact that both the stepwise AIC model
+(5 variables) and LASSO (3 variables) converge on a small subset of the original 12 predictors
+is meaningful — it suggests the remaining predictors carry little additional signal once the
+key variables are accounted for. Agreement between two different selection methods on the same
+small set increases confidence that these are genuinely the most important clinical markers.
+
+```{r lasso-path}
+# The coefficient path shows how each predictor's coefficient changes as the
+# penalty increases from right (no penalty, all variables included) to left
+# (high penalty, most variables zeroed out). Variables that survive to the far
+# left are the most robustly important.
+lasso_path <- glmnet(x_train, y_train, family = "binomial", alpha = 1)
+
+plot(lasso_path, xvar = "lambda", label = TRUE)
+abline(v = log(lasso_cv$lambda.min), lty = 2, col = "blue")
+abline(v = log(lasso_cv$lambda.1se), lty = 2, col = "red")
+legend("topright", legend = c("lambda.min", "lambda.1se"),
+       col = c("blue", "red"), lty = 2)
+```
+
+Each line in this plot is one predictor. Variables that remain non-zero all the way to the
+right dashed line (`lambda.1se`) are those retained in our final LASSO model — they are the
+predictors that survive even aggressive penalisation, indicating they carry the most
+independent predictive signal.
+
+---
+
+## Cross-Validated Model Comparison
+
+Now we train all four models under identical 10-fold CV conditions so performance comparisons
+are fair — every model sees the same folds.
+
+```{r cv-models}
+cv_logistic <- train(
+  DEATH_EVENT ~ ., data = train,
+  method    = "glm",
+  family    = "binomial",
+  trControl = train_control,
+  metric    = "ROC"
+)
+
+cv_logistic_lasso <- train(
+  lasso_formula, data = train,
+  method    = "glm",
+  family    = "binomial",
+  trControl = train_control,
+  metric    = "ROC"
+)
+
+cv_lda <- train(
+  DEATH_EVENT ~ ., data = train,
+  method    = "lda",
+  trControl = train_control,
+  metric    = "ROC"
+)
+
+cv_qda <- train(
+  DEATH_EVENT ~ ., data = train,
+  method    = "qda",
+  trControl = train_control,
+  metric    = "ROC"
+)
+```
+
+```{r cv-results}
+results <- resamples(list(
+  Logistic       = cv_logistic,
+  Logistic_LASSO = cv_logistic_lasso,
+  LDA            = cv_lda,
+  QDA            = cv_qda
+))
+
+summary(results)
+dotplot(results, metric = "ROC")
+```
+
+The dot plot shows each model's cross-validated AUC-ROC with 95% confidence intervals.
+AUC-ROC ranges from 0.5 (no better than random guessing) to 1.0 (perfect discrimination).
+
+Key observations from the CV results:
+
+- **Logistic LASSO and LDA** achieve the highest point estimates, with wide but overlapping
+  confidence intervals — given the small sample size, we cannot confidently declare one
+  superior to the other.
+- **QDA** shows the lowest and most variable performance. This is consistent with the concern
+  raised earlier: estimating separate covariance matrices per class requires more data than
+  this dataset provides, and the result is an unstable model.
+- The confidence intervals are wide across all models, a direct consequence of the small
+  sample. This is an important caveat — with only 60 test patients, a difference of one or
+  two correct classifications can change accuracy by several percentage points.
+
+---
+
+## Final Test Set Evaluation
+
+```{r final-eval}
+x_test <- model.matrix(DEATH_EVENT ~ ., data = test)[, -1]
+
+preds <- data.frame(
+  Logistic       = predict(cv_logistic,       test),
+  Logistic_LASSO = predict(cv_logistic_lasso, test),
+  LDA            = predict(cv_lda,            test),
+  QDA            = predict(cv_qda,            test)
+)
+
+lapply(preds, function(p) confusionMatrix(p, test$DEATH_EVENT, positive = "Yes"))
+```
+
+Reading the confusion matrices — for each model there are four possible outcomes for any
+given patient:
+
+- **True Positive (TP)**: predicted to die, actually died — correct, clinically important
+- **True Negative (TN)**: predicted to survive, actually survived — correct
+- **False Negative (FN)**: predicted to survive, actually died — the most costly error
+- **False Positive (FP)**: predicted to die, actually survived — causes unnecessary concern
+
+In a clinical mortality prediction context, **sensitivity** (the proportion of actual deaths
+correctly identified) is the priority metric — missing a patient who will die is a more
+serious error than a false alarm. We focus on this when comparing models.
+
+The **logistic regression (full) and LDA produce identical confusion matrices** — this is
+not a coincidence. LDA and logistic regression are asymptotically equivalent when the
+predictor distributions are approximately normal and the classes share the same covariance
+structure. Their convergence here suggests those assumptions hold reasonably well, and that
+a linear decision boundary is appropriate for this data.
+
+**QDA's sensitivity is notably lower** than the other models — it misclassifies a
+disproportionate number of actual deaths as survivors. Despite its higher specificity
+(it is good at identifying survivors), this trade-off is unfavourable for a clinical risk
+screening tool.
+
+```{r roc-curve}
+prob_log <- predict(cv_logistic, test, type = "prob")[, 2]
+roc_log  <- roc(test$DEATH_EVENT, prob_log)
+
+plot(roc_log, main = "ROC Curve — Logistic Regression (full model)",
+     col = "steelblue", lwd = 2)
+auc(roc_log)
+```
+
+The ROC curve plots sensitivity against (1 - specificity) across all possible classification
+thresholds. The default threshold of 0.5 — predicting "death" if the model assigns >50%
+probability — is one point on this curve. Depending on the clinical context, a different
+threshold might be preferred: if false negatives (missed deaths) are especially costly,
+lowering the threshold increases sensitivity at the expense of more false alarms.
+
+The **AUC** (Area Under the Curve) summarises overall discriminative performance as a single
+number. An AUC of 0.85 means that for a randomly selected pair of one patient who died and
+one who survived, the model correctly assigns the higher probability to the patient who died
+85% of the time.
+
+---
+
+## Summary of Findings
+
+### Model performance
+
+| Model             | Accuracy | Sensitivity | Specificity | Balanced Acc. |
+|-------------------|----------|-------------|-------------|----------------|
+| Logistic (full)   | 84.7%    | 73.7%       | 90.0%       | 81.8%          |
+| Logistic (LASSO)  | 79.7%    | 63.2%       | 87.5%       | 75.3%          |
+| LDA               | 84.7%    | 73.7%       | 90.0%       | 81.8%          |
+| QDA               | 78.0%    | 47.4%       | 92.5%       | 69.9%          |
+
+The full logistic model and LDA are the best-performing methods on this dataset, achieving
+a balanced accuracy of 81.8% — meaning they are correct roughly 4 times out of 5 when
+accounting equally for both outcome classes.
+
+**LASSO's underperformance relative to the full logistic model** is likely a consequence of
+the conservative `lambda.1se` criterion over-shrinking in a small-sample setting. With only
+239 training patients, removing variables that carry even modest signal can noticeably hurt
+performance. Using `lambda.min` instead would retain more variables and likely recover some
+of this gap.
+
+**QDA's poor sensitivity (47%)** means it misses more than half of actual deaths — a
+clinically unacceptable failure rate for a risk stratification tool. This reinforces the
+earlier concern about estimating class-specific covariance structures with insufficient data.
+
+### Clinical interpretation
+
+The variables consistently selected by both LASSO and stepwise AIC — most notably
+**serum creatinine**, **ejection fraction**, and **follow-up time** — align with established
+clinical knowledge. Serum creatinine is a marker of kidney function, which deteriorates in
+advanced heart failure. Ejection fraction directly measures the heart's pumping efficiency.
+Their emergence as the dominant predictors, across multiple independent selection methods,
+is reassuring that the models are capturing genuine clinical signal rather than noise.
+
+### Limitations
+
+- The dataset contains only 299 patients from a single centre (Faisalabad Institute of
+  Cardiology, Pakistan, 2015). Performance on populations with different demographics or
+  care standards may differ.
+- The small sample produces wide confidence intervals around all performance estimates —
+  the exact figures should be treated as indicative rather than precise.
+- All models use the default 0.5 classification threshold. In practice, this threshold
+  should be adjusted based on the relative costs of false negatives versus false positives
+  in the specific clinical setting — a threshold of 0.3 would increase sensitivity at the
+  cost of more false alarms, which may be the right trade-off for a screening tool.
+- This is an observational dataset. The associations identified do not establish causality —
+  they indicate which measurements are *predictive* of mortality, not necessarily which
+  factors *cause* it.
