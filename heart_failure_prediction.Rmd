@@ -21,8 +21,9 @@ library(MASS)
 library(pROC)
 library(corrplot)
 library(glmnet)
+library(here)
 
-hfc_records <- read.csv("C:/Users/micha/Downloads/heart_failure_clinical_records_dataset.csv",
+hfc_records <- read.csv(here("data", "heart_failure_clinical_records_dataset.csv"),
                         stringsAsFactors = TRUE)
 ```
 
@@ -43,7 +44,7 @@ same cross-validation framework so performance comparisons are fair.
 
 ## Research Questions
 
-**RQ1 — Which clinical measurements are most strongly associated with mortality in heart failure
+**RQ1 - Which clinical measurements are most strongly associated with mortality in heart failure
 patients?**
 
 Understanding which variables matter most guides both clinical triage and future data collection
@@ -54,8 +55,8 @@ that has immediate practical value.
 sacrificing predictive performance compared to a full model?**
 
 Simpler models are easier to explain to clinicians, less likely to overfit on small datasets,
-and cheaper to implement in practice. LASSO is a principled way to find a minimal sufficient
-predictor set — we compare it directly to the full model.
+and cheaper to implement in practice. LASSO is an effective way to find a minimal sufficient
+predictor set to compare directly to the full model.
 
 **RQ3 — Do linear discriminant methods (LDA, QDA) perform competitively with logistic
 regression for this classification task?**
