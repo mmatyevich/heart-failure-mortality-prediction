@@ -21,7 +21,6 @@ library(MASS)
 library(pROC)
 library(corrplot)
 library(glmnet)
-library(dplyr)
 
 hfc_records <- read.csv("C:/Users/micha/Downloads/heart_failure_clinical_records_dataset.csv",
                         stringsAsFactors = TRUE)
