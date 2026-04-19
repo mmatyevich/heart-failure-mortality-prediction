@@ -1,25 +1,19 @@
-# heart-failure-mortality-prediction
-Classification modelling of heart failure outcomes using statistical and regularised methods
+Overview
+This project develops statistical models to predict mortality outcomes in patients with heart failure, with a focus on identifying clinically meaningful risk factors.
 
-## Overview
-This project develops classification models to predict mortality outcomes in heart failure patients.
+Dataset
+Clinical dataset including patient demographics and health indicators
 
-## Dataset
-- Clinical dataset including patient demographics and health indicators
-
-## Methods
+Methods
 - Logistic regression
-- Linear Discriminant Analysis (LDA)
-- Quadratic Discriminant Analysis (QDA)
+- LDA and QDA
 - LASSO regularisation
 - Cross-validation
 
-## Key Findings
-- Regularised models improved model stability and prediction accuracy
+Key Findings
+- Regularised models improved model stability and reduced overfitting
 - Key clinical variables were identified as strong predictors of mortality risk
+- Results demonstrate how different modelling approaches impact interpretability and performance
 
-## Tools
-R (glm, MASS, glmnet, caret)
-
-## Relevance
-Demonstrates classification modelling and evaluation with healthcare data
+Relevance
+Demonstrates application of statistical modelling to clinical data to support risk stratification and inform healthcare decision-making
